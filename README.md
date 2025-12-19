@@ -7,6 +7,11 @@ size and total crime counts, raw proportions can be misleading. A hierarchical m
 allows partial pooling across districts to produce more stable and interpretable estimates.
 
 ### Data
+The raw LAPD crime dataset used in this project is not included in this repository due to GitHub file size limitations.
+However, the data are publicly available from:
+https://catalog.data.gov/dataset/crime-data-from-2020-to-present
+
+- Dataset name: Crime Data from 2020 to Present
 - Source: Los Angeles Open Crime Data (Data.gov)
 - Units: 21 LAPD districts
 - Response: Proportion of serious crimes among total reported crimes
