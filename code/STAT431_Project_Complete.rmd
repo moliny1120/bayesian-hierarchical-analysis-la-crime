@@ -1,0 +1,768 @@
+---
+title: "STAT431 Project"
+output:
+  html_document: default
+  pdf_document:
+    latex_engine: xelatex
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup}
+# 创建 Figure_final 文件夹
+if (!dir.exists("Figure_final")) {
+  dir.create("Figure_final")
+}
+```
+
+```{r load-data}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(janitor)
+
+crimes = read_csv("~/Downloads/Crime_Data_from_2020_to_Present.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(date_occ = mdy_hms(date_occ)) %>%
+  filter(year(date_occ) %in% c(2024, 2025))
+
+head(crimes)
+print(dim(crimes))
+```
+
+```{r weapon-proportion}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+area_weapon_counts <- crimes %>%
+  mutate(weapon_involved = if_else(!is.na(weapon_used_cd) & weapon_used_cd != 0,
+                                   "With Weapon", "Without Weapon")) %>%
+  group_by(area_name, weapon_involved) %>%
+  summarise(count = n(), .groups = "drop")
+
+area_weapon_rate <- area_weapon_counts %>%
+  group_by(area_name) %>%
+  mutate(rate = count / sum(count))
+
+ordered_areas <- area_weapon_rate %>%
+  filter(weapon_involved == "With Weapon") %>%
+  arrange(rate) %>%
+  pull(area_name)
+
+area_weapon_rate$area_name <- factor(area_weapon_rate$area_name, levels = ordered_areas)
+
+p_weapon <- ggplot(area_weapon_rate, aes(x = area_name, y = rate, fill = weapon_involved)) +
+  geom_col(position = "fill") +
+  geom_text(
+    data = subset(area_weapon_rate, weapon_involved == "With Weapon"),
+    aes(label = percent(rate, accuracy = 1)),
+    position = position_fill(vjust = 0.5),
+    color = "black",
+    size = 4
+  ) +
+  coord_flip() +
+  labs(title = "Proportion of Weapon-Related Crimes Across LAPD",
+       x = "LAPD Geographic Area",
+       y = "Proportion of Crimes",
+       fill = "Weapon Involvement") +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 14)
+
+# 保存图片
+ggsave("Figure_final/weapon_proportion.png", plot = p_weapon, width = 10, height = 8, dpi = 300, bg = "white")
+print(p_weapon)
+```
+
+```{r serious-proportion}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+area_serious_counts <- crimes %>%
+  mutate(
+    serious = if_else(crm_cd_1 < 300,
+                      "Serious (<300)",
+                      "Less Serious (>=300)")
+  ) %>%
+  group_by(area_name, serious) %>%
+  summarise(count = n(), .groups = "drop")
+
+area_serious_rate <- area_serious_counts %>%
+  group_by(area_name) %>%
+  mutate(rate = count / sum(count))
+
+ordered_areas <- area_serious_rate %>%
+  filter(serious == "Serious (<300)") %>%
+  arrange(rate) %>%
+  pull(area_name)
+
+area_serious_rate$area_name <- factor(area_serious_rate$area_name, levels = ordered_areas)
+
+p_serious <- ggplot(area_serious_rate, aes(x = area_name, y = rate, fill = serious)) +
+  geom_col(position = "fill") +
+  geom_text(
+    data = subset(area_serious_rate, serious == "Serious (<300)"),
+    aes(label = percent(rate, accuracy = 1)),
+    position = position_fill(vjust = 0.5),
+    color = "black",
+    size = 4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Proportion of Serious Crimes (<300) Across LAPD",
+    x = "LAPD Geographic Area",
+    y = "Proportion of Crimes",
+    fill = "Crime Category"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  theme_minimal(base_size = 14)
+
+# 保存图片
+ggsave("Figure_final/serious_proportion.png", plot = p_serious, width = 10, height = 8, dpi = 300, bg = "white")
+print(p_serious)
+```
+
+```{r crime-locations}
+library(ggplot2)
+library(dplyr)
+
+p_location <- ggplot(crimes, aes(x = lon, y = lat)) +
+  geom_point(alpha = 0.1, color = "blue", size = 0.5) +
+  labs(title = "Crime Locations in LA between 2024 and 2025", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+
+# 保存图片
+ggsave("Figure_final/crime_locations.png", plot = p_location, width = 10, height = 8, dpi = 300, bg = "white")
+print(p_location)
+```
+
+```{r prepare-data}
+library(dplyr)
+
+# By area_name
+serious_by_area <- crimes %>%
+  mutate(serious = crm_cd_1 < 300) %>%   # TRUE = serious crime
+  group_by(area_name) %>%
+  summarise(
+    y = sum(serious, na.rm = TRUE),      # serious crimes count
+    N = n(),                             # total crimes in area
+    prop_serious = y / N,
+    .groups = "drop"
+  ) %>%
+  arrange(area_name)
+
+serious_by_area
+n_areas <- nrow(serious_by_area)
+y <- serious_by_area$y
+N <- serious_by_area$N
+```
+
+```{r jags-data}
+# hyperprior
+a1 <- 2; b1 <- 0.5   # alpha ~ Gamma(2, 0.5)
+a2 <- 2; b2 <- 0.5   # beta  ~ Gamma(2, 0.5)
+
+jags_data_serious <- list(
+  y  = y,
+  N  = N,
+  K  = n_areas,
+  a1 = a1, b1 = b1,
+  a2 = a2, b2 = b2
+)
+```
+
+```{r jags-model}
+serious_model_string <- "model {
+  # likelihood: Binomial for serious crimes in each LAPD area
+  for (i in 1:K) {
+    y[i] ~ dbin(p[i], N[i])      # Y_i | p_i ~ Binomial(N_i, p_i)
+    p[i] ~ dbeta(alpha, beta)    # area-level serious crime rate
+  }
+
+  # hyperpriors for Beta shape parameters (partially informative)
+  alpha ~ dgamma(a1, b1)
+  beta  ~ dgamma(a2, b2)
+
+  # derived quantity: overall mean serious-crime rate across areas
+  mu_p <- alpha / (alpha + beta)
+}"
+
+# write as .bug
+writeLines(serious_model_string, con = "serious_model.bug")
+```
+
+```{r mcmc-diagnostics}
+library(rjags)
+library(coda)
+
+# three chain
+inits_list_serious <- list(
+  list(alpha = 0.5, beta = 0.5),
+  list(alpha = 2.0, beta = 2.0),
+  list(alpha = 5.0, beta = 1.0)
+)
+
+params_pre <- c("alpha", "beta", "mu_p")
+
+mod_serious <- jags.model(
+  file    = "serious_model.bug",
+  data    = jags_data_serious,
+  inits   = inits_list_serious,
+  n.chains = 3,
+  n.adapt  = 0
+)
+
+pre_samp_serious <- coda.samples(
+  model = mod_serious,
+  variable.names = params_pre,
+  n.iter = 5000
+)
+
+# 保存 traceplot
+png("Figure_final/traceplot_alpha.png", width = 800, height = 400, res = 150)
+traceplot(pre_samp_serious[, "alpha"])
+dev.off()
+
+png("Figure_final/traceplot_beta.png", width = 800, height = 400, res = 150)
+traceplot(pre_samp_serious[, "beta"])
+dev.off()
+
+png("Figure_final/traceplot_mu_p.png", width = 800, height = 400, res = 150)
+traceplot(pre_samp_serious[, "mu_p"])
+dev.off()
+
+# 显示在文档中
+traceplot(pre_samp_serious[, "alpha"])
+traceplot(pre_samp_serious[, "beta"])
+traceplot(pre_samp_serious[, "mu_p"])
+
+# Gelman-Rubin PSRF
+gelman.diag(pre_samp_serious, autoburnin = FALSE)
+
+# 保存 Gelman plot
+png("Figure_final/gelman_plot.png", width = 800, height = 600, res = 150)
+gelman.plot(pre_samp_serious, autoburnin = FALSE)
+dev.off()
+
+# 显示在文档中
+gelman.plot(pre_samp_serious, autoburnin = FALSE)
+
+# Autocorrelation plots for one chain
+png("Figure_final/autocorr_chain1.png", width = 800, height = 600, res = 150)
+autocorr.plot(window(pre_samp_serious, 1500)[[1]])
+dev.off()
+
+png("Figure_final/autocorr_chain2.png", width = 800, height = 600, res = 150)
+autocorr.plot(window(pre_samp_serious, 1500)[[2]])
+dev.off()
+
+png("Figure_final/autocorr_chain3.png", width = 800, height = 600, res = 150)
+autocorr.plot(window(pre_samp_serious, 1500)[[3]])
+dev.off()
+
+# 显示在文档中
+autocorr.plot(window(pre_samp_serious, 1500)[[1]])
+autocorr.plot(window(pre_samp_serious, 1500)[[2]])
+autocorr.plot(window(pre_samp_serious, 1500)[[3]])
+```
+
+```{r posterior-sampling}
+# rebuild the model + burn-in
+mod_serious <- jags.model(
+  file    = "serious_model.bug",
+  data    = jags_data_serious,
+  inits   = inits_list_serious,
+  n.chains = 3,
+  n.adapt  = 0
+)
+
+# drop first 1500 as burn-in
+update(mod_serious, 1500)
+
+params_post <- c("alpha", "beta", "mu_p", "p")
+
+post_samp_serious <- coda.samples(
+  model = mod_serious,
+  variable.names = params_post,
+  n.iter = 100000
+)
+
+summary(post_samp_serious)
+```
+
+```{r posterior-analysis}
+post_mat <- as.matrix(post_samp_serious)
+alpha_draws <- post_mat[, "alpha"]
+beta_draws  <- post_mat[, "beta"]
+mu_p_draws  <- post_mat[, "mu_p"]
+
+# Some summary
+c(
+  mean_alpha = mean(alpha_draws),
+  sd_alpha   = sd(alpha_draws)
+)
+
+c(
+  mean_beta = mean(beta_draws),
+  sd_beta   = sd(beta_draws)
+)
+
+quantile(mu_p_draws, c(0.025, 0.5, 0.975))  # overall serious crime rate 95% CI
+
+# 保存 posterior density
+png("Figure_final/posterior_density.png", width = 1200, height = 400, res = 150)
+par(mfrow = c(1, 3))
+plot(density(alpha_draws),
+     main = expression(paste("Posterior density of ", alpha)),
+     xlab = "")
+plot(density(beta_draws),
+     main = expression(paste("Posterior density of ", beta)),
+     xlab = "")
+plot(density(mu_p_draws),
+     main = expression(paste("Posterior density of ", mu[p])),
+     xlab = "")
+dev.off()
+
+# 显示在文档中
+par(mfrow = c(1, 3))
+plot(density(alpha_draws),
+     main = expression(paste("Posterior density of ", alpha)),
+     xlab = "")
+plot(density(beta_draws),
+     main = expression(paste("Posterior density of ", beta)),
+     xlab = "")
+plot(density(mu_p_draws),
+     main = expression(paste("Posterior density of ", mu[p])),
+     xlab = "")
+```
+
+```{r area-posteriors}
+# find all p[i]
+p_cols <- grep("^p\\[", colnames(post_mat))
+p_draws <- post_mat[, p_cols]
+
+p_summary <- apply(
+  p_draws,
+  2,
+  function(z) c(
+    mean = mean(z),
+    sd   = sd(z),
+    q2.5 = quantile(z, 0.025),
+    q50  = quantile(z, 0.50),
+    q97.5 = quantile(z, 0.975)
+  )
+)
+
+p_summary <- as.data.frame(t(p_summary))
+p_summary$area_name <- serious_by_area$area_name
+
+# Sort by posterior mean to see which regions have the highest proportion of serious crimes
+p_summary <- p_summary %>%
+  arrange(desc(mean))
+
+p_summary
+```
+
+```{r posterior-boxplot}
+# Box plot with posterior mean and CI
+ord <- order(colMeans(p_draws), decreasing = FALSE)
+
+# 保存 boxplot
+png("Figure_final/posterior_boxplot.png", width = 1000, height = 1200, res = 150)
+par(mar = c(5, 10, 4, 2) + 0.1)
+boxplot(
+  p_draws[, ord],
+  horizontal = TRUE,
+  names = serious_by_area$area_name[ord],
+  las = 1,
+  cex.axis = 0.60,
+  xlab = "Serious crime proportion",
+  main = "Posterior for serious-crime rate p_i by LAPD area"
+)
+points(
+  serious_by_area$prop_serious[ord],
+  1:ncol(p_draws),
+  col = "red", pch = 19, cex = 1.2
+)
+legend("bottomright", legend = c("sample proportion", "posterior distribution"),
+       pch = c(19, 22), pt.cex = c(1.2, 1), col = c("red", "black"), bty = "n")
+dev.off()
+
+# 显示在文档中
+par(mar = c(5, 10, 4, 2) + 0.1)
+boxplot(
+  p_draws[, ord],
+  horizontal = TRUE,
+  names = serious_by_area$area_name[ord],
+  las = 1,
+  cex.axis = 0.60,
+  xlab = "Serious crime proportion",
+  main = "Posterior for serious-crime rate p_i by LAPD area"
+)
+points(
+  serious_by_area$prop_serious[ord],
+  1:ncol(p_draws),
+  col = "red", pch = 19, cex = 1.2
+)
+legend("bottomright", legend = c("sample proportion", "posterior distribution"),
+       pch = c(19, 22), pt.cex = c(1.2, 1), col = c("red", "black"), bty = "n")
+```
+
+## Map of posterior mean for p_i
+
+```{r map-posterior-mean}
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+lapd_sf <- st_read("~/Downloads/LAPD_Divisions.geojson", quiet = TRUE)
+
+area_lookup <- crimes %>%
+  distinct(area, area_name) %>%
+  arrange(area)
+
+area_lookup
+
+name_match <- tibble::tibble(
+  area_name = c(
+    "Central",
+    "Rampart",
+    "Southwest",
+    "Hollenbeck",
+    "Harbor",
+    "Hollywood",
+    "Wilshire",
+    "West LA",
+    "Van Nuys",
+    "West Valley",
+    "Northeast",
+    "77th Street",
+    "Newton",
+    "Pacific",
+    "N Hollywood",
+    "Foothill",
+    "Devonshire",
+    "Topanga",
+    "Olympic",
+    "Mission",
+    "Southeast"
+  ),
+  APREC = c(
+    "CENTRAL",
+    "RAMPART",
+    "SOUTHWEST",
+    "HOLLENBECK",
+    "HARBOR",
+    "HOLLYWOOD",
+    "WILSHIRE",
+    "WEST LOS ANGELES",
+    "VAN NUYS",
+    "WEST VALLEY",
+    "NORTHEAST",
+    "77TH STREET",
+    "NEWTON",
+    "PACIFIC",
+    "NORTH HOLLYWOOD",
+    "FOOTHILL",
+    "DEVONSHIRE",
+    "TOPANGA",
+    "OLYMPIC",
+    "MISSION",
+    "SOUTHEAST"
+  )
+)
+
+p_map <- p_summary %>%
+  select(area_name, mean) %>%
+  left_join(name_match, by = "area_name")
+
+lapd_map <- lapd_sf %>%
+  left_join(p_map, by = "APREC")
+
+p_map_mean <- ggplot(lapd_map) +
+  geom_sf(aes(fill = mean), color = "white", size = 0.2) +
+  geom_sf_text(aes(label = area_name), size = 1.2, color = "black") +
+  scale_fill_gradient(
+    low  = "#fee5d9",
+    high = "#a50f15",
+    name = "Posterior mean"
+  ) +
+  labs(
+    title   = "Posterior Mean of serious-crime rate by LAPD area",
+    caption = "Darker red = higher estimated serious-crime risk"
+  ) +
+  theme_void(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+# 保存图片
+ggsave("Figure_final/map_posterior_mean.png", plot = p_map_mean, width = 10, height = 8, dpi = 300, bg = "white")
+print(p_map_mean)
+```
+
+## Map of posterior SD for p_i
+
+```{r map-posterior-sd}
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+p_sd_map <- p_summary %>%
+  select(area_name, sd) %>%
+  left_join(name_match, by = "area_name")
+
+lapd_sd_map <- lapd_sf %>%
+  left_join(p_sd_map, by = "APREC")
+
+p_map_sd <- ggplot(lapd_sd_map) +
+  geom_sf(aes(fill = sd), color = "white", size = 0.2) +
+  geom_sf_text(aes(label = area_name), size = 1.2, color = "black") +
+  scale_fill_gradient(
+    low  = "#deebf7",
+    high = "#08519c",
+    name = "Posterior SD"
+  ) +
+  labs(
+    title   = "Posterior SD of serious-crime rate by LAPD area",
+    caption = "Darker blue = higher posterior uncertainty"
+  ) +
+  theme_void(base_size = 10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+# 保存图片
+ggsave("Figure_final/map_posterior_sd.png", plot = p_map_sd, width = 10, height = 8, dpi = 300, bg = "white")
+print(p_map_sd)
+```
+
+## Sensitivity analysis for Gamma hyperpriors
+
+```{r sensitivity-analysis}
+library(rjags)
+library(coda)
+library(dplyr)
+
+run_hyper_model <- function(a1, b1, a2, b2, label) {
+  data_list <- list(
+    y = y,
+    N = N,
+    K = n_areas,
+    a1 = a1, b1 = b1,
+    a2 = a2, b2 = b2
+  )
+
+  mod <- jags.model(
+    file = "serious_model.bug",
+    data = data_list,
+    n.chains = 3,
+    n.adapt = 0
+  )
+
+  update(mod, 1500)
+
+  samp <- coda.samples(
+    model = mod,
+    variable.names = c("alpha", "beta", "p"),
+    n.iter = 40000
+  )
+
+  mat <- as.matrix(samp)
+  p_cols <- grep("^p\\[", colnames(mat))
+
+  list(
+    label = label,
+    alpha_mean = mean(mat[, "alpha"]),
+    beta_mean = mean(mat[, "beta"]),
+    p_means = colMeans(mat[, p_cols])
+  )
+}
+
+# baseline
+fit_base <- run_hyper_model(2, 0.5, 2, 0.5, "Gamma(2,0.5)")
+fit_diffuse <- run_hyper_model(1, 0.25, 1, 0.25, "Gamma(1,0.25)")
+fit_conc <- run_hyper_model(4, 1, 4, 1, "Gamma(4,1)")
+
+# put all into a dataframe
+sens_df <- data.frame(
+  area_name = serious_by_area$area_name,
+  base = fit_base$p_means,
+  diffuse = fit_diffuse$p_means,
+  conc = fit_conc$p_means
+)
+
+head(sens_df)
+
+cor(sens_df$base, sens_df$diffuse)
+cor(sens_df$base, sens_df$conc)
+
+# 保存敏感性分析图
+png("Figure_final/sensitivity_diffuse.png", width = 600, height = 600, res = 150)
+plot(
+  sens_df$base, sens_df$diffuse,
+  xlab = "Posterior mean p_i (Gamma(2,0.5))",
+  ylab = "Posterior mean p_i (Gamma(1,0.25))",
+  main = "Sensitivity Analysis: Diffuse Prior"
+)
+abline(0, 1, col = "red")
+dev.off()
+
+png("Figure_final/sensitivity_conc.png", width = 600, height = 600, res = 150)
+plot(
+  sens_df$base, sens_df$conc,
+  xlab = "Posterior mean p_i (Gamma(2,0.5))",
+  ylab = "Posterior mean p_i (Gamma(4,1))",
+  main = "Sensitivity Analysis: Concentrated Prior"
+)
+abline(0, 1, col = "red")
+dev.off()
+
+# 显示在文档中
+plot(
+  sens_df$base, sens_df$diffuse,
+  xlab = "Posterior mean p_i (Gamma(2,0.5))",
+  ylab = "Posterior mean p_i (Gamma(1,0.25))"
+)
+abline(0, 1, col = "red")
+```
+
+```{r}
+## ------------------------------------------------------------------
+## Posterior predictive checks: simulate replicated serious-crime counts
+
+set.seed(123)
+
+# 使用一部分后验样本做 PPC，避免内存太大
+n_rep <- 2000
+iter_idx <- sample(seq_len(nrow(p_draws)), n_rep)
+
+# 观测数据
+y_obs  <- y          # serious_by_area$y
+N_vec  <- N          # serious_by_area$N
+K      <- length(y_obs)
+
+# 为每个后验样本生成一组 y_rep (21 个 area)
+y_rep_mat <- matrix(NA_integer_, nrow = n_rep, ncol = K)
+
+for (s in seq_len(n_rep)) {
+  y_rep_mat[s, ] <- rbinom(
+    n    = K,
+    size = N_vec,
+    prob = p_draws[iter_idx[s], ]
+  )
+}
+
+dim(y_rep_mat)  # 检查维度，应该是 2000 x 21
+
+```
+
+```{r}
+## ------------------------------------------------------------------
+## Global posterior predictive check: overall serious-crime proportion
+
+# 观测的整体严重犯罪比例
+T_obs <- sum(y_obs) / sum(N_vec)
+
+# 每个 replicated dataset 下的整体比例
+T_rep <- rowSums(y_rep_mat) / sum(N_vec)
+
+# posterior predictive p-value (双尾也可以，但最简单先单尾)
+ppc_p_value <- mean(T_rep >= T_obs)
+ppc_p_value
+
+# 画直方图 + 竖线标出观测值
+hist(
+  T_rep,
+  breaks = 30,
+  freq   = FALSE,
+  main   = "Posterior predictive distribution of overall serious-crime proportion",
+  xlab   = "Overall serious-crime proportion"
+)
+abline(v = T_obs, col = "red", lwd = 2)
+legend(
+  "topright",
+  legend = c("Observed proportion"),
+  col    = "red",
+  lwd    = 2,
+  bty    = "n"
+)
+
+```
+
+```{r}
+## ------------------------------------------------------------------
+## Area-level posterior predictive checks: y_rep / N vs observed proportion
+
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+# 把 y_rep 转成 proportion
+prop_rep_mat <- sweep(y_rep_mat, 2, N_vec, "/")
+
+ppc_df <- as.data.frame(prop_rep_mat)
+colnames(ppc_df) <- serious_by_area$area_name
+
+ppc_long <- ppc_df %>%
+  mutate(draw = seq_len(n_rep)) %>%
+  pivot_longer(
+    cols      = -draw,
+    names_to  = "area_name",
+    values_to = "prop_rep"
+  )
+
+obs_df <- serious_by_area %>%
+  select(area_name, prop_serious)
+
+ggplot(ppc_long, aes(x = prop_rep)) +
+  geom_histogram(bins = 30, fill = "grey80", colour = "white") +
+  geom_vline(
+    data = obs_df,
+    aes(xintercept = prop_serious),
+    colour  = "red",
+    linetype = "dashed"
+  ) +
+  facet_wrap(~ area_name, scales = "free") +
+  labs(
+    title = "Posterior predictive checks for area-level serious-crime proportions",
+    x     = "Replicated serious-crime proportion",
+    y     = "Frequency"
+  ) +
+  theme_minimal(base_size = 9)
+
+```
+
+```{r}
+# Posterior Predictive Distribution
+y_rep <- matrix(NA, nrow = nrow(post_mat), ncol = n_areas)
+for (i in 1:nrow(post_mat)) {
+  for (j in 1:n_areas) {
+    y_rep[i, j] <- rbinom(1, N[j], post_mat[i, paste0("p[", j, "]")])
+  }
+}
+
+T_obs <- sum(y)
+T_rep <- apply(y_rep, 1, sum)
+
+# Bayesian p-value
+mean(T_rep >= T_obs)
+
+hist(T_rep, breaks = 50, col = "lightblue", 
+     main = "Posterior Predictive Distribution",
+     xlab = "Total serious crimes")
+abline(v = T_obs, col = "red", lwd = 2)
+```
+
+
+
+
