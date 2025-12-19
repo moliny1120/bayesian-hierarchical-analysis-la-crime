@@ -24,3 +24,8 @@ with limited observations benefit most from partial pooling.
 
 ### Files
 - `report.pdf`: Full analysis and results
+-  `data`: Raw dataset from Kaggle
+-  `code`: R scripts for data cleaning, modeling, and visualization
+
+### Authors
+Yiming Gao, Yuran Wang, Molin Yang, Rongsheng Zhang
